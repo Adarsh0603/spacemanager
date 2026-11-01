@@ -234,38 +234,63 @@ fn reveal_file(path: &std::path::Path) {
     let _ = std::process::Command::new("explorer").arg("/select,").arg(path).spawn();
 }
 
-fn draw_node(ui: &mut egui::Ui, res: &ScanResult, idx: usize, parent_size: u64, act: &mut Option<DeleteReq>) {
+/// Reserve a background slot for the next row; fill it with `paint_stripe` once the row rect is known.
+fn stripe_slot(ui: &egui::Ui) -> egui::layers::ShapeIdx {
+    ui.painter().add(egui::Shape::Noop)
+}
+
+/// Paint a zebra background across the full visible width on odd rows.
+fn paint_stripe(ui: &egui::Ui, slot: egui::layers::ShapeIdx, row_rect: egui::Rect, odd: bool) {
+    if !odd {
+        return;
+    }
+    let clip = ui.clip_rect();
+    let rect = egui::Rect::from_x_y_ranges(clip.x_range(), row_rect.y_range()).expand2(egui::vec2(0.0, 1.0));
+    ui.painter().set(slot, egui::Shape::rect_filled(rect, 0.0, ui.visuals().faint_bg_color));
+}
+
+fn draw_node(ui: &mut egui::Ui, res: &ScanResult, idx: usize, parent_size: u64, act: &mut Option<DeleteReq>, row: &mut usize) {
     let n = &res.nodes[idx];
+    let odd = *row % 2 == 1;
+    *row += 1;
+    let slot = stripe_slot(ui);
     let pct = if parent_size > 0 { n.size as f64 * 100.0 / parent_size as f64 } else { 100.0 };
     let text = egui::RichText::new(format!("{:>10}  {:>5.1}%  {}", human(n.size), pct, n.name)).monospace();
 
-    let resp = if n.children.is_empty() {
-        ui.horizontal(|ui| {
+    let (resp, row_rect) = if n.children.is_empty() {
+        let r = ui.horizontal(|ui| {
             ui.add_space(ui.spacing().indent);
             ui.label(text)
-        })
-        .inner
+        });
+        (r.inner, r.response.rect)
     } else {
-        egui::CollapsingHeader::new(text)
+        let r = egui::CollapsingHeader::new(text)
             .id_salt(idx)
             .show(ui, |ui| {
                 for &c in n.children.iter().take(MAX_CHILDREN_SHOWN) {
-                    draw_node(ui, res, c, n.size, act);
+                    draw_node(ui, res, c, n.size, act, row);
                 }
                 if n.children.len() > MAX_CHILDREN_SHOWN {
                     ui.label(format!("... {} more folders", n.children.len() - MAX_CHILDREN_SHOWN));
                 }
                 let own = res.own_files_size(idx);
                 if own > 0 {
-                    ui.label(
+                    let slot = stripe_slot(ui);
+                    let odd = *row % 2 == 1;
+                    *row += 1;
+                    let r = ui.label(
                         egui::RichText::new(format!("{:>10}  (files in this folder: {})", human(own), n.files))
                             .monospace()
                             .weak(),
                     );
+                    paint_stripe(ui, slot, r.rect, odd);
                 }
-            })
-            .header_response
+            });
+        let h = r.header_response;
+        let rect = h.rect;
+        (h, rect)
     };
+    paint_stripe(ui, slot, row_rect, odd);
     resp.context_menu(|ui| {
         if ui.button("Open in Explorer").clicked() {
             reveal(&n.path);
@@ -356,11 +381,13 @@ impl eframe::App for App {
             egui::Panel::right("largest").default_size(420.0).show(ui, |ui| {
                 ui.heading("Largest files");
                 egui::ScrollArea::vertical().id_salt("files").show(ui, |ui| {
-                    for (size, path) in &res.largest {
+                    for (i, (size, path)) in res.largest.iter().enumerate() {
+                        let slot = stripe_slot(ui);
                         let name = path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
                         let resp = ui
                             .label(egui::RichText::new(format!("{:>10}  {}", human(*size), name)).monospace())
                             .on_hover_text(path.display().to_string());
+                        paint_stripe(ui, slot, resp.rect, i % 2 == 1);
                         resp.context_menu(|ui| {
                             if ui.button("Show in Explorer").clicked() {
                                 reveal_file(path);
@@ -383,7 +410,8 @@ impl eframe::App for App {
                 ui.heading("Folders");
                 egui::ScrollArea::both().id_salt("tree").show(ui, |ui| {
                     if !res.nodes.is_empty() {
-                        draw_node(ui, res, 0, res.nodes[0].size, &mut act);
+                        let mut row = 0usize;
+                        draw_node(ui, res, 0, res.nodes[0].size, &mut act, &mut row);
                     }
                 });
             });
