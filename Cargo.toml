@@ -6,3 +6,4 @@ edition = "2024"
 [dependencies]
 clap = { version = "4.6.7", features = ["derive"] }
 jwalk = "0.9.0"
+windows-sys = { version = "0.59", features = ["Win32_Foundation", "Win32_Storage_FileSystem", "Win32_Security"] }
