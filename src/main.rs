@@ -1,6 +1,7 @@
 use clap::Parser;
-use jwalk::WalkDir;
-use std::collections::HashMap;
+use jwalk::WalkDirGeneric;
+use std::cmp::Reverse;
+use std::collections::{BinaryHeap, HashMap};
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -42,10 +43,11 @@ fn main() {
     let errors_cb = Arc::clone(&errors);
 
     let mut by_top: HashMap<String, u64> = HashMap::new();
-    let mut files: Vec<(u64, PathBuf)> = Vec::new();
+    // min-heap: smallest of the kept top-N sits at the root
+    let mut heap: BinaryHeap<Reverse<(u64, PathBuf)>> = BinaryHeap::new();
     let mut count: u64 = 0;
 
-    let walker = WalkDir::new(&root)
+    let walker = WalkDirGeneric::<((), Option<u64>)>::new(&root)
         .skip_hidden(false)
         .follow_links(false)
         .process_read_dir(move |_, _, _, children| {
@@ -58,6 +60,17 @@ fn main() {
                     false
                 }
             });
+            // stat files here: this callback runs on the worker pool, not the consumer thread
+            for child in children.iter_mut().flatten() {
+                if child.file_type().is_file() {
+                    match child.metadata() {
+                        Ok(m) => child.client_state = Some(m.len()),
+                        Err(_) => {
+                            errors_cb.fetch_add(1, Ordering::Relaxed);
+                        }
+                    }
+                }
+            }
         });
 
     for entry in walker.into_iter() {
@@ -71,7 +84,7 @@ fn main() {
         if !entry.file_type().is_file() {
             continue;
         }
-        let size = entry.metadata().map(|m| m.len()).unwrap_or(0);
+        let size = entry.client_state.unwrap_or(0);
         count += 1;
 
         let rel = entry.path();
@@ -88,12 +101,18 @@ fn main() {
         *by_top.entry(top).or_insert(0) += size;
 
         // keep only the largest N files in memory
-        if files.len() < args.top || size > files[files.len() - 1].0 {
-            files.push((size, entry.path()));
-            files.sort_by(|a, b| b.0.cmp(&a.0));
-            files.truncate(args.top);
+        if args.top > 0 {
+            if heap.len() < args.top {
+                heap.push(Reverse((size, entry.path())));
+            } else if let Some(Reverse((min, _))) = heap.peek() {
+                if size > *min {
+                    heap.pop();
+                    heap.push(Reverse((size, entry.path())));
+                }
+            }
         }
     }
+    let files = heap.into_sorted_vec(); // ascending of Reverse = descending by size
 
     let mut dirs: Vec<_> = by_top.into_iter().collect();
     dirs.sort_by(|a, b| b.1.cmp(&a.1));
@@ -103,7 +122,7 @@ fn main() {
         println!("{:>10}  {}", human(*size), name);
     }
     println!("\nLargest files:");
-    for (size, path) in &files {
+    for Reverse((size, path)) in &files {
         println!("{:>10}  {}", human(*size), path.display());
     }
     println!("\nScanned {} files in {:.1?}", count, start.elapsed());
